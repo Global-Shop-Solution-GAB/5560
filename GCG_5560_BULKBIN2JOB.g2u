@@ -1,0 +1,376 @@
+Program.Sub.Preflight.Start
+Program.External.Include.Library("450100.lib")
+
+Program.Sub.Preflight.End
+
+Program.Sub.Main.Start
+'CODED BY SILAS 6/18/2019
+'Coded for C3 Corp, Bulk Issue Bin to Work Order
+'This is a script tied to a GS MObile Transaction Custom Hook, the inputs are Job+Suffix and BIN.
+'See Quote 11368 and Call Ref# COR180-6320191549-9
+
+v.Local.stemp.Declare(String)
+v.Global.stxid.Declare(String)
+v.Global.sTXDetails.Declare(String)
+v.Global.sTXHeader.Declare(String)
+v.Global.sJob.Declare(String)
+v.Global.sBin.Declare(String)
+
+'openconnection
+f.ODBC.Connection!con.opencompanyconnection
+f.ODBC.Connection!conC.OpenConnection(v.Ambient.Ccon,v.Ambient.Cuser,v.Ambient.Cpass)
+
+'clean up transactions older than 90 days
+f.Intrinsic.Control.CallSub(cleanupbitable)
+
+'mobile transaction id
+v.Global.stxid.Set(v.Passed.DATA-TRANSID)
+
+'get header
+f.Global.Mobile.GetCustomHeader(v.Global.stxid,v.Global.sTXHeader)
+
+'get details
+f.Global.Mobile.GetCustomLine(v.Global.stxid,v.Global.sTXDetails)
+f.Intrinsic.String.Split(v.Global.sTXDetails,"*!*",v.Local.stemp)
+
+'set BIN
+v.Global.sBin.Set(v.Local.stemp(1).trim)
+
+'Set Job
+f.Intrinsic.String.StripCharacters(v.Local.stemp(2),v.Global.sJob)
+
+'check BIN and Job
+f.Intrinsic.Control.CallSub(checkScannedExceptions)
+
+'get Printer
+f.Intrinsic.Control.CallSub(getPrinter)
+
+'go ahead and display message that Transaction is being processed
+f.Intrinsic.Control.CallSub(displayMSG)
+
+'check bin, get parts in bin
+f.Intrinsic.Control.CallSub(getParts)
+
+'print audit trail
+f.Intrinsic.Control.CallSub(callBI)
+
+'done
+f.Intrinsic.Control.End
+
+Program.Sub.Main.End
+
+Program.Sub.logAddLine.Start
+F.Intrinsic.Control.Try
+	V.Local.sError.Declare(String," ")
+	'(Callable Sub) - used as you go through the parts in the scanned bin, write data to a table by GS Mobile User + Transaction info (Part, Bin, Qtys, Job), this report (Audit Trail) will be printed at the end
+	v.Local.sSql.Declare(String)
+	
+'	CREATE TABLE "GCG_5560_BI_AUDIT"(
+' "TXID" CHAR(9),
+' "TX_LOG_DETAIL_LN" CHAR(150),
+' "TX_EXCEPTION_TYPE" INTEGER DEFAULT '0');
+	
+	f.Intrinsic.String.Build("Insert into GCG_5560_BI_AUDIT values ('{0}','{1}',{2})",v.Global.stxid,v.Args.sLog,v.Args.iType,v.Local.sSql)
+	f.ODBC.Connection!con.Execute(v.Local.sSql)
+					
+	F.Intrinsic.Control.ExitSub
+
+F.Intrinsic.Control.Catch
+	F.Intrinsic.Control.If(V.Ambient.ErrorNumber,<>,0)
+		F.Intrinsic.String.Build("Project: {0}{1}Subroutine: {2}{1}Error Occurred {3} with description {4}","",V.Ambient.NewLine,V.Ambient.CurrentSubroutine,V.Ambient.ErrorNumber,V.Ambient.ErrorDescription,V.Local.sError)
+		F.Intrinsic.UI.Msgbox(V.Local.sError)
+	F.Intrinsic.Control.EndIf
+Function.Intrinsic.Control.EndTry
+Program.Sub.logAddLine.End
+
+Program.Sub.getParts.Start
+F.Intrinsic.Control.Try
+	V.Local.sError.Declare(String," ")
+	'get all parts in bin where > 0, then check each part against scanned job and see if there are requirements for it, build issue material file/data table as you go through it.
+	'will be loading the datatable that is in the 450100.lib file and then eventually calling int he end if we have valid records to issue. 
+
+
+
+	'NOTES FROM QUOTE
+	'GAB Script will run from Wirepoll and process the Issue material logic.
+	'a. Perform Check/Issue-Material for every Part in BIN.
+	'b. While performing steps for each part, a log of messages for each part will be recorded for a report
+	'(audit-trail) to print after the transaction is complete @ the assigned default laser printer.
+	
+	'c. If Qty in BIN <= Qty Required on Work Order Sequence and the Job/Sequence is Open
+	'i. Issue ALL Qty in BIN to Work Order M Sequence for Matching part.
+	'ii. Record Message ([part#] - [Qty] of [Qty-Required] Issued From [BIN#] for [Job]-[Suffix]-
+	'[Sequence#] )
+	
+	'd. If Qty in BIN > Qty Required on Work Order and the Job/Sequence is Open
+	'i. Record Error Message ([Qty] in [BIN#] > [Qty-Required] for [Part#], [Sequence#].)
+	
+	'e. If Part NOT Required on Work Order
+	'i. Record Error Message ([Part#], [Qty] in [BIN#] , NOT required on [Job#])
+	
+	'f. If Material Line is Open for a Work order and Part NOT Found in BIN Scanned
+	'i. Record Error Message ([Part#], [Sequence#] - [Qty-Required] NOT Found in [BIN#])
+
+	v.Local.sSql.Declare(String)
+	v.Local.sPart.Declare(String)
+	v.Local.sRev.Declare(String)
+	v.Local.sJob.Declare(String)
+	v.Local.sSuf.Declare(String)
+	v.Local.sTemp.Declare(String)
+	v.Local.i.Declare(Long)
+	v.Local.sRet.Declare(String)
+	
+	'only keeping the global variable concat together for ease of use in SQL Queries
+	f.Intrinsic.String.Split(v.Global.sJob,"-",v.Local.sTemp)
+	'local vars used for building datatable in 450100.lib
+	v.Local.sJob.Set(v.Local.sTemp(0).trim)
+	v.Local.sSuf.Set(v.Local.sTemp(1).trim)
+	
+	'build Item Master DataTable for Scanned BIN (all unique LBHS records where QUANTITY > 0) - this excludes 0 balance item master records if they dont purge.
+	f.Intrinsic.String.Build("select ltrim(rtrim(PART)) as PART,LOT,BIN,HEAT,SERIAL_NUMBER,QUANTITY from v_ITEM_MASTER where QUANTITY > 0 and BIN = '{0}' order by PART",v.Global.sBin,v.Local.sSql)
+	f.Data.DataTable.CreateFromSQL("dtBIN","con",v.Local.sSql,True)
+	f.Data.DataTable.AddColumn("dtBIN","OVER","Boolean")
+	f.Data.DataTable.AddColumn("dtBIN","SEQ","String")
+	
+	'first check parts in Job that are still required against sum of matching parts in the scanned bin. 
+	'getting actual required by subtracting hours_actual from Hours_estimated for the M Sequences for real parts, excluding misc mat seqs.
+	f.Intrinsic.String.Build("Select ltrim(rtrim(PART)) as PART,SEQ,DESCRIPTION,HOURS_ESTIMATED - HOURS_ACTUAL as QTY_REQUIRED  from v_JOB_OPERATIONS where ltrim(Rtrim(job))+'-'+ltrim(rtrim(suffix)) = '{0}' and LMO = 'M'and SEQ < '995000' and QTY_REQUIRED > 0",v.Global.sJob,v.Local.sSql)
+	f.Data.DataTable.CreateFromSQL("dtMOps","con",v.Local.sSql,True)
+	f.Data.DataTable.AddColumn("dtMOps","TOTAL_INBIN","Float")
+	
+	'build dictionary with sum of qty by part
+	f.Intrinsic.String.Build("Select ltrim(rtrim(PART)) as PART,Sum(Quantity) as TOTAL_INBIN from v_ITEM_MASTER where PART in (Select PART from v_JOB_OPERATIONS where ltrim(Rtrim(job))+'-'+ltrim(rtrim(suffix)) = '{0}' and LMO = 'M'and SEQ < '995000') and BIN = '{1}' group by part",v.Global.sJob,v.Global.sBin,v.Local.sSql)
+	f.Data.Dictionary.CreateFromSQL("dcSumOnHand","con",v.Local.sSql)
+	f.Data.Dictionary.SetDefaultReturn("dcSumOnHand",0.000000)
+	f.Data.DataTable.FillFromDictionary("dtMOps","dcSumOnHand","PART","TOTAL_INBIN")
+
+	'if Qty in Bin > Qty Required, then log error. 
+	f.Data.DataTable.AddExpressionColumn("dtMOps","OVER","Boolean","IIF(TOTAL_INBIN > QTY_REQUIRED,TRUE,FALSE)")
+	f.Intrinsic.Control.For(v.Local.i,0,v.DataTable.dtMOps.RowCount--,1)
+		f.Intrinsic.Control.If(v.DataTable.dtMOps(v.Local.i).OVER!FieldVal,=,TRUE)
+			f.Intrinsic.String.Build("Part: {3} | Sum of Qty-in-Bin: {0} > Qty-Required: {2} on Work Order Sequence: {4}",v.DataTable.dtMOps(v.Local.i).TOTAL_INBIN!FieldVal,v.Global.sBin,v.DataTable.dtMOps(v.Local.i).QTY_REQUIRED!FieldVal,v.DataTable.dtMOps(v.Local.i).PART!FieldVal,v.DataTable.dtMOps(v.Local.i).SEQ!FieldVal,v.Local.sTemp)
+			'Exception Type = 2 (Qty in Bin > Qty Required on Scanned Job)for Table Data (Group Report by Exception Type)
+			f.Intrinsic.Control.CallSub(logAddLine,"sLog",v.Local.sTemp,"iType",2)
+			
+		f.Intrinsic.Control.ElseIf(v.DataTable.dtMOps(v.Local.i).TOTAL_INBIN!FieldVal,=,0)
+			
+			f.Intrinsic.String.Build("Part: {3} | NO QUANTITY Found in BIN for Required Qty: {2} on Work Order Sequence: {4}",v.DataTable.dtMOps(v.Local.i).TOTAL_INBIN!FieldVal,v.Global.sBin,v.DataTable.dtMOps(v.Local.i).QTY_REQUIRED!FieldVal,v.DataTable.dtMOps(v.Local.i).PART!FieldVal,v.DataTable.dtMOps(v.Local.i).SEQ!FieldVal,v.Local.sTemp)
+			'Exception Type = 4 (No Qty Found in Bin for Required Part on Scanned Job)for Table Data (Group Report by Exception Type)
+			f.Intrinsic.Control.CallSub(logAddLine,"sLog",v.Local.sTemp,"iType",4)
+		f.Intrinsic.Control.EndIf
+	f.Intrinsic.Control.Next(v.Local.i)
+
+	'now fill OVER from dictionary to the BIN dataable so we can skip past those records
+	f.Data.Dictionary.CreateFromDataTable("dcOVER","dtMOps","PART","OVER")
+	f.Data.Dictionary.SetDefaultReturn("dcOVER",False)
+	f.Data.DataTable.FillFromDictionary("dtBIN","dcOVER","PART","OVER")
+	'Fill SEQ from Dictionary (assuming customer only lists Material ONCE per Router (Checked with Joe Rasmissi from Customer on this 6/18/2019))
+	f.Data.Dictionary.CreateFromDataTable("dcSEQ","dtMOps","PART","SEQ")
+	f.Data.Dictionary.SetDefaultReturn("dcSEQ","000000")
+	f.Data.DataTable.FillFromDictionary("dtBIN","dcSEQ","PART","SEQ")
+	
+	'go through and check each part not already caught in the exceptions above
+	f.Intrinsic.Control.For(v.Local.i,0,v.DataTable.dtBIN.RowCount--,1)
+		f.Intrinsic.Control.If(v.DataTable.dtBIN(v.Local.i).OVER!FieldVal,<>,TRUE)
+			f.Intrinsic.Control.SelectCase(v.DataTable.dtBIN(v.Local.i).SEQ!FieldValTrim)
+				f.Intrinsic.Control.Case("000000")
+					'if SEQ = 000000, that means this part is NOT called for on the JOB, so Write Error Log per Part+LBHS Record
+					f.Intrinsic.String.Build("Part: {0} | Qty-in-Bin: {1} | NOT Required on Work Order: {2}",v.DataTable.dtBIN(v.Local.i).PART!FieldValTrim,v.DataTable.dtBIN(v.Local.i).QUANTITY!FieldVal,v.Global.sJob,v.Local.sTemp)
+					'Exception Type = 1 (Not Required on SCanned Job)for Table Data (Group Report by Exception Type)
+					f.Intrinsic.Control.CallSub(logAddLine,"sLog",v.Local.sTemp,"iType",1)
+				f.Intrinsic.Control.CaseElse
+					'if SEQ <> 000000, that means it was filled from Dictionary with a Valid SEQ and since the record is NOT marked as OVER = TRUE, then we can issue. 
+					f.Intrinsic.String.RPad(v.DataTable.dtBIN(v.Local.i).PART!FieldValTrim," ",20,v.Local.sPart)
+					f.Intrinsic.String.Right(v.Local.sPart,3,v.Local.sRev)
+					f.Intrinsic.String.Left(v.Local.sPart,17,v.Local.sPart)
+					
+					f.Data.DataTable.AddRow("450100","PART",v.Local.sPart.Trim,"REV",v.Local.sRev.Trim,"LOCATION","","Quantity",v.DataTable.dtBIN(v.Local.i).QUANTITY!FieldVal,"Lot",v.DataTable.dtBIN(v.Local.i).LOT!FieldValTrim,"Bin",v.DataTable.dtBIN(v.Local.i).BIN!FieldValTrim,"Heat",v.DataTable.dtBIN(v.Local.i).HEAT!FieldValTrim,"Serial",v.DataTable.dtBIN(v.Local.i).SERIAL_NUMBER!FieldValTrim,"WONumber",v.Local.sJob.trim,"WOSuffix",v.Local.sSuf.trim,"WOSeq",v.DataTable.dtBIN(v.Local.i).SEQ!FieldValTrim)
+					'log Issue material to Log
+					f.Intrinsic.String.Build("Part: {0} | Qty-in-Bin: {1} | Issued to to Work Order: {2} on Seq: {3}",v.DataTable.dtBIN(v.Local.i).PART!FieldValTrim,v.DataTable.dtBIN(v.Local.i).QUANTITY!FieldVal,v.Global.sJob,v.DataTable.dtBIN(v.Local.i).SEQ!FieldValTrim,v.Local.sTemp)
+					'Exception Type = 3 (Issued to Job) for Table Data (Group Report by Exception Type)
+					f.Intrinsic.Control.CallSub(logAddLine,"sLog",v.Local.sTemp,"iType",3)
+			f.Intrinsic.Control.EndSelect
+		f.Intrinsic.Control.EndIf
+	f.Intrinsic.Control.Next(v.Local.i)
+
+'only call if valid records are added to the 450100.lib datatable ffor the callwrapper
+f.Intrinsic.Control.If(v.DataTable.450100(0).PART!FieldValTrim,<>,"")
+	f.Intrinsic.Control.CallSub(450100Sync)
+f.Intrinsic.Control.EndIf
+
+	F.Intrinsic.Control.ExitSub
+
+F.Intrinsic.Control.Catch
+	F.Intrinsic.Control.If(V.Ambient.ErrorNumber,<>,0)
+		F.Intrinsic.String.Build("Project: {0}{1}Subroutine: {2}{1}Error Occurred {3} with description {4}","",V.Ambient.NewLine,V.Ambient.CurrentSubroutine,V.Ambient.ErrorNumber,V.Ambient.ErrorDescription,V.Local.sError)
+		F.Intrinsic.UI.Msgbox(V.Local.sError)
+	F.Intrinsic.Control.EndIf
+Function.Intrinsic.Control.EndTry
+Program.Sub.getParts.End
+
+Program.Sub.issue2job.Start
+F.Intrinsic.Control.Try
+	V.Local.sError.Declare(String," ")
+	'while going through the parts in bin (getParts), this sub is called to build the datatable used in callrapper mode 450100.lib (Issue Material)
+
+	F.Intrinsic.Control.ExitSub
+
+F.Intrinsic.Control.Catch
+	F.Intrinsic.Control.If(V.Ambient.ErrorNumber,<>,0)
+		F.Intrinsic.String.Build("Project: {0}{1}Subroutine: {2}{1}Error Occurred {3} with description {4}","",V.Ambient.NewLine,V.Ambient.CurrentSubroutine,V.Ambient.ErrorNumber,V.Ambient.ErrorDescription,V.Local.sError)
+		F.Intrinsic.UI.Msgbox(V.Local.sError)
+	F.Intrinsic.Control.EndIf
+Function.Intrinsic.Control.EndTry
+
+Program.Sub.issue2job.End
+
+Program.Sub.callBI.Start
+F.Intrinsic.Control.Try
+	V.Local.sError.Declare(String," ")
+	'print audit trail
+	v.Local.iRptID.Declare(Long)
+	v.Local.iBIRunID.Declare(long)
+	v.Local.iBILogID.Declare(Long)
+	V.Local.sParams.Declare(String)
+	V.Local.sValues.Declare(String)
+	V.local.iRet.Declare(Long)
+
+	'initialize gssrl
+	f.Global.BI.GetRunID(v.Local.iBIRunID)
+	f.Global.BI.GetIDFromName("GCG_5560_BIN2JOB_AUDIT.rpt",v.Local.iRptID)
+	f.Global.BI.StartLogging(v.Local.iBIRunID,v.Local.iRptID,0,"",v.Local.iBILogID)
+
+	'set params and values
+	V.Local.sParams.Set("TXID*!*USERNAME*!*BIN*!*JOB")
+	F.Intrinsic.String.Build("{0}*!*{1}*!*{2}*!*{3}",v.Global.stxid,v.Global.sUser,v.Global.sBin,v.Global.sJob,V.Local.sValues)
+	
+	'print report
+	F.Global.BI.RunReportPreProcessor(V.Local.iBIRunID,v.Local.iBILogID,V.Local.sParams,V.Local.sValues,"",8,True,"",1,v.Global.sPrinter,-1,"","",V.Local.iRet)
+
+	F.Intrinsic.Control.ExitSub
+
+F.Intrinsic.Control.Catch
+	F.Intrinsic.Control.If(V.Ambient.ErrorNumber,<>,0)
+		F.Intrinsic.String.Build("Project: {0}{1}Subroutine: {2}{1}Error Occurred {3} with description {4}","",V.Ambient.NewLine,V.Ambient.CurrentSubroutine,V.Ambient.ErrorNumber,V.Ambient.ErrorDescription,V.Local.sError)
+		F.Intrinsic.UI.Msgbox(V.Local.sError)
+	F.Intrinsic.Control.EndIf
+Function.Intrinsic.Control.EndTry
+Program.Sub.callBI.End
+
+Program.Sub.displayMSG.Start
+F.Intrinsic.Control.Try
+	V.Local.sError.Declare(String," ")
+	v.Local.sTemp.Declare(String)
+
+	f.Intrinsic.String.Build("Transaction Being Processed; Audit Trail will Print to Printer: {0} for Job:{1} and BIN:{2}",v.Global.sPrinter,v.Global.sJob,v.Global.sBIN,v.Local.sTemp)
+	f.Global.Mobile.SetCustomResult(v.Caller.CompanyCode,v.Global.stxid,v.Local.sTemp)
+
+	F.Intrinsic.Control.ExitSub
+
+F.Intrinsic.Control.Catch
+	F.Intrinsic.Control.If(V.Ambient.ErrorNumber,<>,0)
+		F.Intrinsic.String.Build("Project: {0}{1}Subroutine: {2}{1}Error Occurred {3} with description {4}","",V.Ambient.NewLine,V.Ambient.CurrentSubroutine,V.Ambient.ErrorNumber,V.Ambient.ErrorDescription,V.Local.sError)
+		F.Intrinsic.UI.Msgbox(V.Local.sError)
+	F.Intrinsic.Control.EndIf
+Function.Intrinsic.Control.EndTry
+Program.Sub.displayMSG.End
+
+Program.Sub.checkScannedExceptions.Start
+F.Intrinsic.Control.Try
+	V.Local.sError.Declare(String," ")
+	v.Local.sSQL.Declare(String)
+	v.Local.sRet.Declare(String)
+	v.Local.sMsg.Declare(String)
+
+	'check BIN
+	f.Intrinsic.String.Build("Select BIN from BIN_MASTER where ltrim(rtrim(BIN)) = '{0}' and ltrim(rtrim(location)) = ''",v.Global.sBin.Trim,v.Local.sSQL)
+	f.ODBC.Connection!con.executeandreturn(v.Local.sSQL,v.Local.sRet)
+	f.Intrinsic.Control.If(v.Local.sRet.Trim,=,"")
+		'build display message if no result
+		f.Intrinsic.String.Build("<h1>TRANSACTION ERROR!!!</h1> <br/>Bin: <b>{0}</b> is NOT a Valid BIN in Global Shop",v.Global.sBin,v.local.sMsg)
+	f.Intrinsic.Control.EndIf
+	
+	'check valid job is open.
+	f.Intrinsic.String.Build("Select job+'-'+suffix from v_JOB_HEADER where DATE_CLOSED = '1900-01-01' and ltrim(rtrim(JOB))+ltrim(rtrim(SUFFIX)) = '{0}'",v.Global.sJob,v.Local.sSQL)
+	f.ODBC.Connection!con.executeandreturn(v.Local.sSQL,v.Local.sRet)
+	v.Global.sJob.Set(v.Local.sRet)
+	f.Intrinsic.Control.If(v.Local.sRet.Trim,=,"")
+		'build display message if no result
+		f.Intrinsic.String.Build("{0}<br/>JOB+SUFFIX: <b>{1}</b> is NOT a Valid JOB+SUFFIX Scan (Must be (000123001) where 000123 = JOB and 001 = Suffix)",v.Local.sMsg,v.Global.sJob,v.local.sMsg)
+	f.Intrinsic.Control.EndIf
+		
+	'post message if error
+	f.Intrinsic.Control.If(v.Local.sMsg.Trim,<>,"")
+		f.Global.Mobile.SetCustomResult(v.Caller.CompanyCode,v.Global.stxid,v.Local.sMsg)	
+		f.Intrinsic.Control.End
+	f.Intrinsic.Control.EndIf
+	
+	F.Intrinsic.Control.ExitSub
+
+F.Intrinsic.Control.Catch
+	F.Intrinsic.Control.If(V.Ambient.ErrorNumber,<>,0)
+		F.Intrinsic.String.Build("Project: {0}{1}Subroutine: {2}{1}Error Occurred {3} with description {4}","",V.Ambient.NewLine,V.Ambient.CurrentSubroutine,V.Ambient.ErrorNumber,V.Ambient.ErrorDescription,V.Local.sError)
+		F.Intrinsic.UI.Msgbox(V.Local.sError)
+	F.Intrinsic.Control.EndIf
+Function.Intrinsic.Control.EndTry
+Program.Sub.checkScannedExceptions.End
+
+Program.Sub.getPrinter.Start
+F.Intrinsic.Control.Try
+	V.Local.sError.Declare(String," ")
+	v.Global.sPrinter.Declare(String)
+	v.Global.sUser.Declare(String)
+	v.Local.sTemp.Declare(String)
+	v.Local.sSQL.Declare(String)
+	
+	'get USERID from transaction header
+	f.Intrinsic.String.Build("Select USER_ID from WIRELESS_HDR where TRANS_ID = '{0}'",v.Global.stxid,v.Local.sSQL)
+	f.ODBC.Connection!con.executeandreturn(v.Local.sSQL,v.Local.sTemp)
+	v.Global.sUser.Set(v.Local.sTemp)
+	
+	'get mobile UID so I can get printer
+	f.Intrinsic.String.Build("Select UID from MOBILE_USER_INFO where USERID = '{0}'",v.Local.sTemp.Trim,v.Local.sSQL)
+	f.ODBC.Connection!conC.executeandreturn(v.Local.sSQL,v.Local.sTemp)
+	
+	'get printer name TYPE = 4 for default laser printer in GS MObil Users.
+	f.Intrinsic.String.Build("Select NAME from MOBILE_USER_PRINTER where TYPE = 4 and UID = '{0}'",v.Local.sTemp.Trim,v.Local.sSQL)
+	f.ODBC.Connection!conC.executeandreturn(v.Local.sSQL,v.Global.sPrinter)
+
+	F.Intrinsic.Control.ExitSub
+
+F.Intrinsic.Control.Catch
+	F.Intrinsic.Control.If(V.Ambient.ErrorNumber,<>,0)
+		F.Intrinsic.String.Build("Project: {0}{1}Subroutine: {2}{1}Error Occurred {3} with description {4}","",V.Ambient.NewLine,V.Ambient.CurrentSubroutine,V.Ambient.ErrorNumber,V.Ambient.ErrorDescription,V.Local.sError)
+		F.Intrinsic.UI.Msgbox(V.Local.sError)
+	F.Intrinsic.Control.EndIf
+Function.Intrinsic.Control.EndTry
+Program.Sub.getPrinter.End
+
+Program.Sub.cleanupbitable.Start
+F.Intrinsic.Control.Try
+	V.Local.sError.Declare(String," ")
+	'this sub is called from main and cleans up transactions in our BI table that are older than 90 days or there is NOT a matching record in WIRELESS_HDR
+	v.Local.sSQL.Declare(String)
+	v.Local.dDate.Declare(Date)
+	v.Local.sDate.Declare(String)
+	f.Intrinsic.Date.DateAdd("D",-90,v.Ambient.Date,v.Local.dDate)
+	f.Intrinsic.String.Format(v.Local.dDate,"YYYY-MM-DD",v.Local.sDate)
+	
+	'older than 90 days
+	f.Intrinsic.String.Build("Delete from GCG_5560_BI_AUDIT where TXID in (Select TRANS_ID from v_WIRELESS_HDR where ATTEMPTED_DATE < '{0}')",v.Local.sDate,v.Local.sSQL)
+	f.ODBC.Connection!con.execute(v.Local.sSQL)
+	
+	'delete records not found as well
+	v.Local.sSQL.Set("Delete from GCG_5560_BI_AUDIT where TXID NOT in (Select TRANS_ID from v_WIRELESS_HDR)")
+	f.ODBC.Connection!con.execute(v.Local.sSQL)
+
+	F.Intrinsic.Control.ExitSub
+
+F.Intrinsic.Control.Catch
+	F.Intrinsic.Control.If(V.Ambient.ErrorNumber,<>,0)
+		F.Intrinsic.String.Build("Project: {0}{1}Subroutine: {2}{1}Error Occurred {3} with description {4}","",V.Ambient.NewLine,V.Ambient.CurrentSubroutine,V.Ambient.ErrorNumber,V.Ambient.ErrorDescription,V.Local.sError)
+		F.Intrinsic.UI.Msgbox(V.Local.sError)
+	F.Intrinsic.Control.EndIf
+Function.Intrinsic.Control.EndTry
+
+Program.Sub.cleanupbitable.End
